@@ -357,7 +357,7 @@
     async function fetchNewsHeadlines(query) {
       try {
         const url = `https://r.jina.ai/https://news.google.com/search?q=${encodeURIComponent(query)}`;
-        const res = await fetchWithTimeout(url);
+        const res = await fetchWithTimeout(url, {}, 9000);
         if (!res.ok) return [];
         const text = await res.text();
         const matches = text.match(/title\":\"(.*?)\"/g) || [];
@@ -366,6 +366,23 @@
           .filter((m) => m && !m.toLowerCase().includes('google news'))
           .slice(0, 3);
         return cleaned.map((headline, idx) => buildSourceEntry(`News headline ${idx + 1}`, headline));
+      } catch (error) {
+        return [];
+      }
+    }
+
+    async function fetchSearchSnippets(query) {
+      try {
+        const url = `https://r.jina.ai/https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+        const res = await fetchWithTimeout(url, {}, 9000);
+        if (!res.ok) return [];
+        const html = await res.text();
+        const snippets = Array.from(html.matchAll(/<a rel="nofollow" class="result__a".*?>(.*?)<\/a>/g))
+          .map((m) => m[1])
+          .map((raw) => raw.replace(/<.*?>/g, ''))
+          .filter(Boolean)
+          .slice(0, 3);
+        return snippets.map((text, idx) => buildSourceEntry(`Reference snippet ${idx + 1}`, text));
       } catch (error) {
         return [];
       }
@@ -384,17 +401,26 @@
     function buildGenericAssessment(claim, evidence) {
       const connotation_detected = detectConnotation(claim);
       const institutionalHits = evidence.filter((item) => item.source?.includes('(institutional)')).length;
+      const evidenceSet = evidence.length ? evidence : fabricateEvidence(claim);
+      const truth_score = evidence.length
+        ? scoreClaim(claim, evidence.length, institutionalHits)
+        : 'Not a verifiable fact';
+
       return {
-        truth_score: scoreClaim(claim, evidence.length, institutionalHits),
+        truth_score,
         connotation_detected,
-        supporting_evidence: evidence.length ? evidence : fabricateEvidence(claim),
+        supporting_evidence: evidenceSet,
         final_assessment: evidence.length
-          ? 'Assessment generated from live open sources; score reflects connotation plus source coverage.'
-          : 'The statement is too broad or situational to rate definitively without targeted sourcing. Provide more context to continue.',
+          ? 'Assessment generated from live institutional and journalistic sources; score reflects connotation plus cross-coverage.'
+          : 'The statement is too broad or insufficiently sourced to rate definitively without targeted context.',
         explanation_available: true,
         _explanation: {
-          weighting: evidence.length ? 'Live institutional and journalistic signals inform the rating; official sources are prioritized where present.' : 'Institutional references are prioritized; journalistic outlets provide triangulation.',
-          contradictions: evidence.length ? 'Review headlines for disagreement or corroboration; conflicting framings reduce confidence.' : 'No definitive consensus identified without additional qualifiers.',
+          weighting: evidence.length
+            ? 'Live institutional and journalistic signals inform the rating; official sources and corroborating coverage raise confidence.'
+            : 'Institutional references are prioritized; fabricated placeholders are used until live sources are available.',
+          contradictions: evidence.length
+            ? 'Review headlines for disagreement or corroboration; conflicting framings reduce confidence.'
+            : 'No definitive consensus identified without additional qualifiers.',
           framing: connotation_detected,
           score: evidence.length
             ? 'Score blends connotation penalties/bonuses with breadth of live sources returned; institutional hits carry extra weight.'
@@ -411,16 +437,18 @@
       const institutional = await fetchInstitutionalSnippets(normalized);
 
       setStatus('Scanning reference sources…');
-      const [wiki, duck, headlines] = await Promise.all([
+      const [wiki, duck, headlines, snippets] = await Promise.all([
         fetchWikipediaSummary(normalized),
         fetchDuckDuckGoAbstract(normalized),
-        fetchNewsHeadlines(normalized)
+        fetchNewsHeadlines(normalized),
+        fetchSearchSnippets(normalized)
       ]);
 
       const collected = [];
       if (institutional?.length) collected.push(...institutional);
       if (wiki) collected.push(wiki);
       if (duck) collected.push(duck);
+      if (snippets?.length) collected.push(...snippets);
       if (headlines?.length) collected.push(...headlines);
 
       return buildGenericAssessment(normalized, collected);
