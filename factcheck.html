@@ -285,6 +285,64 @@
 
       return 'Neutral or descriptive phrasing detected.';
     }
+
+    function detectContextualVariant(claim) {
+      const contexts = [
+        {
+          label: 'September 11 attacks origin',
+          canonicalQuery: 'September 11 attacks official investigations responsibility',
+          patterns: [
+            /9\/?11.*inside job/i,
+            /nine eleven.*inside job/i,
+            /9\/?11 (isn'?t|wasn'?t) real/i,
+            /(twin towers|world trade center).*(hoax|fake|staged|fiction)/i,
+            /(pentagon|shanksville).*missile/i
+          ]
+        },
+        {
+          label: 'COVID-19 reality and origin',
+          canonicalQuery: 'COVID-19 pandemic reality virology public health data',
+          patterns: [
+            /(covid|corona(virus)?).*(hoax|fake|not real|does not exist)/i,
+            /(covid|coronavirus).*plandemic/i,
+            /(covid|coronavirus).*bioweapon/i
+          ]
+        },
+        {
+          label: 'Moon landing authenticity',
+          canonicalQuery: 'Apollo moon landing evidence and authenticity',
+          patterns: [
+            /moon landing.*(hoax|fake|studio|soundstage)/i,
+            /apollo (11|missions).*(hoax|fake)/i
+          ]
+        },
+        {
+          label: 'Climate change reality',
+          canonicalQuery: 'climate change scientific consensus global warming data',
+          patterns: [
+            /climate change.*(hoax|fake|not real)/i,
+            /global warming.*(hoax|fake|not happening)/i
+          ]
+        },
+        {
+          label: 'Vaccine safety and efficacy',
+          canonicalQuery: 'vaccine safety efficacy public health data',
+          patterns: [
+            /vaccines?.*(dangerous|do not work|fake)/i,
+            /mrna.*(poison|dangerous|deadly)/i
+          ]
+        }
+      ];
+
+      for (const context of contexts) {
+        const match = context.patterns.find((pattern) => pattern.test(claim));
+        if (match) {
+          return { ...context, matchedVariant: match.toString() };
+        }
+      }
+
+      return null;
+    }
     function scoreClaim(claim, evidenceCount, institutionalHits, newsHits) {
       let score = 50;
       const lower = claim.toLowerCase();
@@ -476,27 +534,41 @@
       const normalized = claim.trim();
       if (!normalized) return buildGenericAssessment(claim, []);
 
+      const context = detectContextualVariant(normalized);
+      const queries = Array.from(new Set([normalized, context?.canonicalQuery].filter(Boolean)));
+
       setStatus('Scanning official and institutional sources…');
-      const institutional = await fetchInstitutionalSnippets(normalized);
+      const collected = [];
+
+      for (const query of queries) {
+        const institutional = await fetchInstitutionalSnippets(query);
+        if (institutional?.length) collected.push(...institutional);
+      }
 
       setStatus('Scanning reference sources…');
-      const [wiki, duck, headlines, snippets, outlets] = await Promise.all([
-        fetchWikipediaSummary(normalized),
-        fetchDuckDuckGoAbstract(normalized),
-        fetchNewsHeadlines(normalized),
-        fetchSearchSnippets(normalized),
-        fetchOutletSnippets(normalized)
-      ]);
+      for (const query of queries) {
+        const [wiki, duck, headlines, snippets, outlets] = await Promise.all([
+          fetchWikipediaSummary(query),
+          fetchDuckDuckGoAbstract(query),
+          fetchNewsHeadlines(query),
+          fetchSearchSnippets(query),
+          fetchOutletSnippets(query)
+        ]);
 
-      const collected = [];
-      if (institutional?.length) collected.push(...institutional);
-      if (wiki) collected.push(wiki);
-      if (duck) collected.push(duck);
-      if (snippets?.length) collected.push(...snippets);
-      if (headlines?.length) collected.push(...headlines);
-      if (outlets?.length) collected.push(...outlets);
+        if (wiki) collected.push(wiki);
+        if (duck) collected.push(duck);
+        if (snippets?.length) collected.push(...snippets);
+        if (headlines?.length) collected.push(...headlines);
+        if (outlets?.length) collected.push(...outlets);
+      }
 
-      return buildGenericAssessment(normalized, collected);
+      const assessment = buildGenericAssessment(normalized, collected);
+      if (context) {
+        assessment._explanation.context = `Mapped to canonical topic: ${context.label} (triggered by ${context.matchedVariant}).`;
+        assessment.context_detected = context.label;
+      }
+
+      return assessment;
     }
 
     function renderJSON(data) {
@@ -510,12 +582,13 @@
         explanationBlock.textContent = 'Explanation will be populated after the first run.';
         return;
       }
-      const { weighting, contradictions, framing, score } = data._explanation;
+      const { weighting, contradictions, framing, score, context } = data._explanation;
       explanationBlock.innerHTML = `
         <p><strong>How evidence was weighed:</strong> ${weighting}</p>
         <p><strong>Contradictions between sources:</strong> ${contradictions}</p>
         <p><strong>Political/agenda framing:</strong> ${framing}</p>
         <p><strong>Why the truth score was chosen:</strong> ${score}</p>
+        ${context ? `<p><strong>Context normalization:</strong> ${context}</p>` : ''}
       `;
     }
 
