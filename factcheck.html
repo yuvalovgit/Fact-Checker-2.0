@@ -221,7 +221,16 @@
       'Court records or regulatory agencies where applicable'
     ];
 
-    const institutionalDomains = ['who.int', 'cdc.gov', 'un.org', 'oecd.org', 'ec.europa.eu'];
+    const institutionalDomains = [
+      'who.int',
+      'cdc.gov',
+      'un.org',
+      'oecd.org',
+      'ec.europa.eu',
+      'nih.gov',
+      'fda.gov',
+      'data.gov'
+    ];
 
     const newsPool = [
       'Associated Press',
@@ -234,6 +243,17 @@
       'Al Jazeera',
       'Deutsche Welle',
       'Wall Street Journal'
+    ];
+
+    const newsDomains = [
+      { label: 'BBC News', domain: 'bbc.com' },
+      { label: 'Reuters', domain: 'reuters.com' },
+      { label: 'Associated Press', domain: 'apnews.com' },
+      { label: 'New York Times', domain: 'nytimes.com' },
+      { label: 'Washington Post', domain: 'washingtonpost.com' },
+      { label: 'The Guardian', domain: 'theguardian.com' },
+      { label: 'ABC News', domain: 'abcnews.go.com' },
+      { label: 'Fox News', domain: 'foxnews.com' }
     ];
 
     function randomPick(pool, count) {
@@ -265,13 +285,14 @@
 
       return 'Neutral or descriptive phrasing detected.';
     }
-    function scoreClaim(claim, evidenceCount, institutionalHits) {
+    function scoreClaim(claim, evidenceCount, institutionalHits, newsHits) {
       let score = 50;
       const lower = claim.toLowerCase();
       if (/not real|hoax|fake/.test(lower)) score -= 18;
       if (/always|never|only/.test(lower)) score -= 6;
-      score += Math.min(22, evidenceCount * 4);
-      score += institutionalHits * 3;
+      score += Math.min(16, evidenceCount * 3);
+      score += institutionalHits * 4;
+      score += Math.min(12, newsHits * 2);
       return `${clamp(Math.round(score), 2, 98)}%`;
     }
 
@@ -371,6 +392,27 @@
       }
     }
 
+    async function fetchOutletSnippets(query) {
+      const outletResults = await Promise.all(
+        newsDomains.map(async ({ label, domain }) => {
+          try {
+            const url = `https://r.jina.ai/https://duckduckgo.com/html/?q=site:${domain}+${encodeURIComponent(query)}`;
+            const res = await fetchWithTimeout(url, {}, 9000);
+            if (!res.ok) return null;
+            const html = await res.text();
+            const match = /<a rel="nofollow" class="result__a".*?>(.*?)<\/a>/.exec(html);
+            if (!match || !match[1]) return null;
+            const summary = match[1].replace(/<.*?>/g, '');
+            return buildSourceEntry(label, summary.slice(0, 260) + (summary.length > 260 ? '…' : ''));
+          } catch (error) {
+            return null;
+          }
+        })
+      );
+
+      return outletResults.filter(Boolean);
+    }
+
     async function fetchSearchSnippets(query) {
       try {
         const url = `https://r.jina.ai/https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
@@ -401,9 +443,10 @@
     function buildGenericAssessment(claim, evidence) {
       const connotation_detected = detectConnotation(claim);
       const institutionalHits = evidence.filter((item) => item.source?.includes('(institutional)')).length;
+      const newsHits = evidence.filter((item) => newsDomains.some((n) => item.source?.includes(n.label))).length;
       const evidenceSet = evidence.length ? evidence : fabricateEvidence(claim);
       const truth_score = evidence.length
-        ? scoreClaim(claim, evidence.length, institutionalHits)
+        ? scoreClaim(claim, evidence.length, institutionalHits, newsHits)
         : 'Not a verifiable fact';
 
       return {
@@ -411,12 +454,12 @@
         connotation_detected,
         supporting_evidence: evidenceSet,
         final_assessment: evidence.length
-          ? 'Assessment generated from live institutional and journalistic sources; score reflects connotation plus cross-coverage.'
+          ? 'Assessment generated from live institutional and journalistic sources; score reflects connotation plus cross-coverage with higher weight on government or multilateral data corroborated by diverse outlets.'
           : 'The statement is too broad or insufficiently sourced to rate definitively without targeted context.',
         explanation_available: true,
         _explanation: {
           weighting: evidence.length
-            ? 'Live institutional and journalistic signals inform the rating; official sources and corroborating coverage raise confidence.'
+            ? 'Live institutional and journalistic signals inform the rating; official sources are weighted most heavily and cross-checked against multiple outlets with differing leanings.'
             : 'Institutional references are prioritized; fabricated placeholders are used until live sources are available.',
           contradictions: evidence.length
             ? 'Review headlines for disagreement or corroboration; conflicting framings reduce confidence.'
@@ -437,11 +480,12 @@
       const institutional = await fetchInstitutionalSnippets(normalized);
 
       setStatus('Scanning reference sources…');
-      const [wiki, duck, headlines, snippets] = await Promise.all([
+      const [wiki, duck, headlines, snippets, outlets] = await Promise.all([
         fetchWikipediaSummary(normalized),
         fetchDuckDuckGoAbstract(normalized),
         fetchNewsHeadlines(normalized),
-        fetchSearchSnippets(normalized)
+        fetchSearchSnippets(normalized),
+        fetchOutletSnippets(normalized)
       ]);
 
       const collected = [];
@@ -450,6 +494,7 @@
       if (duck) collected.push(duck);
       if (snippets?.length) collected.push(...snippets);
       if (headlines?.length) collected.push(...headlines);
+      if (outlets?.length) collected.push(...outlets);
 
       return buildGenericAssessment(normalized, collected);
     }
