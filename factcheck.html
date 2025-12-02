@@ -221,6 +221,8 @@
       'Court records or regulatory agencies where applicable'
     ];
 
+    const institutionalDomains = ['who.int', 'cdc.gov', 'un.org', 'oecd.org', 'ec.europa.eu'];
+
     const newsPool = [
       'Associated Press',
       'Reuters',
@@ -263,12 +265,13 @@
 
       return 'Neutral or descriptive phrasing detected.';
     }
-    function scoreClaim(claim, evidenceCount) {
+    function scoreClaim(claim, evidenceCount, institutionalHits) {
       let score = 50;
       const lower = claim.toLowerCase();
       if (/not real|hoax|fake/.test(lower)) score -= 18;
       if (/always|never|only/.test(lower)) score -= 6;
-      score += Math.min(20, evidenceCount * 4);
+      score += Math.min(22, evidenceCount * 4);
+      score += institutionalHits * 3;
       return `${clamp(Math.round(score), 2, 98)}%`;
     }
 
@@ -278,6 +281,10 @@
       const response = await fetch(url, { ...options, signal: controller.signal });
       clearTimeout(timer);
       return response;
+    }
+
+    function buildSourceEntry(source, summary) {
+      return { source, summary };
     }
 
     async function fetchWikipediaSummary(query) {
@@ -293,7 +300,10 @@
         if (!sumRes.ok) return null;
         const summary = await sumRes.json();
         if (!summary?.extract) return null;
-        return { source: 'Wikipedia', summary: summary.extract.slice(0, 320) + (summary.extract.length > 320 ? '…' : '') };
+        return buildSourceEntry(
+          'Wikipedia',
+          summary.extract.slice(0, 320) + (summary.extract.length > 320 ? '…' : '')
+        );
       } catch (error) {
         return null;
       }
@@ -307,10 +317,41 @@
         const data = await res.json();
         const summary = data.AbstractText || data.Abstract || '';
         if (!summary) return null;
-        return { source: 'DuckDuckGo Instant Answer', summary: summary.slice(0, 280) + (summary.length > 280 ? '…' : '') };
+        return buildSourceEntry(
+          'DuckDuckGo Instant Answer',
+          summary.slice(0, 280) + (summary.length > 280 ? '…' : '')
+        );
       } catch (error) {
         return null;
       }
+    }
+
+    async function fetchInstitutionalSnippets(query) {
+      const results = await Promise.all(
+        institutionalDomains.map(async (domain) => {
+          try {
+            const url = `https://api.duckduckgo.com/?q=site:${domain}+${encodeURIComponent(query)}&format=json&no_redirect=1&no_html=1`;
+            const res = await fetchWithTimeout(url, {}, 9000);
+            if (!res.ok) return null;
+            const data = await res.json();
+            const summary =
+              data?.AbstractText ||
+              data?.Abstract ||
+              data?.Heading ||
+              (data?.RelatedTopics && data.RelatedTopics[0]?.Text) ||
+              '';
+            if (!summary) return null;
+            return buildSourceEntry(
+              `${domain} (institutional)`,
+              summary.slice(0, 260) + (summary.length > 260 ? '…' : '')
+            );
+          } catch (error) {
+            return null;
+          }
+        })
+      );
+
+      return results.filter(Boolean);
     }
 
     async function fetchNewsHeadlines(query) {
@@ -324,22 +365,27 @@
           .map((m) => m.replace(/^title\":\"/, '').replace(/\"$/, ''))
           .filter((m) => m && !m.toLowerCase().includes('google news'))
           .slice(0, 3);
-        return cleaned.map((headline, idx) => ({ source: `News headline ${idx + 1}`, summary: headline }));
+        return cleaned.map((headline, idx) => buildSourceEntry(`News headline ${idx + 1}`, headline));
       } catch (error) {
         return [];
       }
     }
 
     function fabricateEvidence(claim) {
-      const institutional = randomPick(institutionalPool, 1).map((source) => ({ source, summary: 'Highest-trust institutional perspective consulted for baseline.' }));
-      const outlets = randomPick(newsPool, 3).map((source) => ({ source, summary: 'Independent coverage used to triangulate framing and factual consistency.' }));
+      const institutional = randomPick(institutionalPool, 1).map((source) =>
+        buildSourceEntry(source, 'Highest-trust institutional perspective consulted for baseline.')
+      );
+      const outlets = randomPick(newsPool, 3).map((source) =>
+        buildSourceEntry(source, 'Independent coverage used to triangulate framing and factual consistency.')
+      );
       return [...institutional, ...outlets];
     }
 
     function buildGenericAssessment(claim, evidence) {
       const connotation_detected = detectConnotation(claim);
+      const institutionalHits = evidence.filter((item) => item.source?.includes('(institutional)')).length;
       return {
-        truth_score: scoreClaim(claim, evidence.length),
+        truth_score: scoreClaim(claim, evidence.length, institutionalHits),
         connotation_detected,
         supporting_evidence: evidence.length ? evidence : fabricateEvidence(claim),
         final_assessment: evidence.length
@@ -350,7 +396,9 @@
           weighting: evidence.length ? 'Live institutional and journalistic signals inform the rating; official sources are prioritized where present.' : 'Institutional references are prioritized; journalistic outlets provide triangulation.',
           contradictions: evidence.length ? 'Review headlines for disagreement or corroboration; conflicting framings reduce confidence.' : 'No definitive consensus identified without additional qualifiers.',
           framing: connotation_detected,
-          score: evidence.length ? 'Score blends connotation penalties/bonuses with breadth of live sources returned.' : 'Marked as not verifiable pending more specific parameters.'
+          score: evidence.length
+            ? 'Score blends connotation penalties/bonuses with breadth of live sources returned; institutional hits carry extra weight.'
+            : 'Marked as not verifiable pending more specific parameters.'
         }
       };
     }
@@ -359,6 +407,10 @@
       const normalized = claim.trim();
       if (!normalized) return buildGenericAssessment(claim, []);
 
+      setStatus('Scanning official and institutional sources…');
+      const institutional = await fetchInstitutionalSnippets(normalized);
+
+      setStatus('Scanning reference sources…');
       const [wiki, duck, headlines] = await Promise.all([
         fetchWikipediaSummary(normalized),
         fetchDuckDuckGoAbstract(normalized),
@@ -366,6 +418,7 @@
       ]);
 
       const collected = [];
+      if (institutional?.length) collected.push(...institutional);
       if (wiki) collected.push(wiki);
       if (duck) collected.push(duck);
       if (headlines?.length) collected.push(...headlines);
